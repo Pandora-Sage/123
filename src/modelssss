@@ -1,0 +1,349 @@
+
+import torch
+from torch import nn
+import torch.nn.functional as F
+import math
+from modules.unimf import MultimodalTransformerEncoder, TransformerEncoder
+from transformers import BertTokenizer, BertModel
+from modules.position_embedding import SinusoidalPositionalEmbedding
+
+class BertTextEncoder(nn.Module):
+    def __init__(self, language='en', use_finetune=False):
+        """
+        language: en / cn
+        """
+        super(BertTextEncoder, self).__init__()
+
+        assert language in ['en', 'cn']
+
+        tokenizer_class = BertTokenizer
+        model_class = BertModel
+        if language == 'en':
+            self.tokenizer = tokenizer_class.from_pretrained('pretrained_bert/bert_en', do_lower_case=True)
+            self.model = model_class.from_pretrained('pretrained_bert/bert_en')
+        elif language == 'cn':
+            self.tokenizer = tokenizer_class.from_pretrained('pretrained_bert/bert_cn')
+            self.model = model_class.from_pretrained('pretrained_bert/bert_cn')
+
+        self.use_finetune = use_finetune
+
+    def get_tokenizer(self):
+        return self.tokenizer
+
+    def from_text(self, text):
+        """
+        text: raw data
+        """
+        input_ids = self.get_id(text)
+        with torch.no_grad():
+            last_hidden_states = self.model(input_ids)[0]  # Models outputs are now tuples
+        return last_hidden_states
+    
+    def forward(self, text):
+        """
+        text: (batch_size, 3, seq_len)
+        3: input_ids, input_mask, segment_ids
+        input_ids: input_ids,
+        input_mask: attention_mask,
+        segment_ids: token_type_ids
+        """
+        input_ids, input_mask, segment_ids = text[:, 0, :].long(), text[:, 1, :].float(), text[:, 2, :].long()
+        if self.use_finetune:
+            last_hidden_states = self.model(input_ids=input_ids,
+                                            attention_mask=input_mask,
+                                            token_type_ids=segment_ids)[0]  # Models outputs are now tuples
+        else:
+            with torch.no_grad():
+                last_hidden_states = self.model(input_ids=input_ids,
+                                                attention_mask=input_mask,
+                                                token_type_ids=segment_ids)[0]  # Models outputs are now tuples
+        return last_hidden_states
+
+class CFMModel(nn.Module):
+
+
+    def __init__(self, hyp_params):
+        """
+        CFMModel Ultimate Version (The "Champion" Version: 0.8125)
+        - Strategy: MLP Prompt Generator + Summary Conditioning
+        - Robustness: Mean Pooling resists noise better than Cross-Attention on small datasets.
+        """
+        super(CFMModel, self).__init__()
+        
+        # --- 1. 基础参数 ---
+        self.modalities = hyp_params.modalities
+        self.embed_dim = hyp_params.embed_dim
+        self.num_heads = hyp_params.num_heads
+        self.attn_dropout = hyp_params.attn_dropout
+        self.relu_dropout = hyp_params.relu_dropout
+        self.out_dropout = hyp_params.out_dropout
+        self.embed_dropout = hyp_params.embed_dropout
+        self.dataset = hyp_params.dataset
+        self.use_bert = hyp_params.use_bert
+        output_dim = hyp_params.output_dim
+
+        # 维度计算
+        if hyp_params.dataset in ['meld_senti', 'meld_emo']:
+            self.orig_l_len, self.orig_a_len = hyp_params.l_len, hyp_params.a_len
+            self.orig_d_l, self.orig_d_a = hyp_params.orig_d_l, hyp_params.orig_d_a
+        else:
+            self.orig_l_len, self.orig_a_len, self.orig_v_len = (
+                hyp_params.l_len, hyp_params.a_len, hyp_params.v_len
+            )
+            self.orig_d_l, self.orig_d_a, self.orig_d_v = (
+                hyp_params.orig_d_l, hyp_params.orig_d_a, hyp_params.orig_d_v
+            )
+        
+        self.l_kernel_size = hyp_params.l_kernel_size
+        self.a_kernel_size = hyp_params.a_kernel_size
+        if hyp_params.dataset in ['meld_senti', 'meld_emo']:
+            self.v_kernel_size = 1 
+        else:
+            self.v_kernel_size = hyp_params.v_kernel_size
+        
+        self.l_len = self.orig_l_len - self.l_kernel_size + 1
+        self.a_len = self.orig_a_len - self.a_kernel_size + 1
+        if hyp_params.dataset in ['meld_senti', 'meld_emo']:
+            self.v_len = 0
+        else:
+            self.v_len = self.orig_v_len - self.v_kernel_size + 1
+
+        # --- 2. 基础模块 ---
+        if self.dataset in ['meld_senti', 'meld_emo']:
+            self.cls_len = 33
+            self.proj_cls = nn.Conv1d(self.orig_d_l + self.orig_d_a, self.embed_dim, kernel_size=1)
+        else:
+            self.cls_len = 1
+            self.cls = nn.Parameter(torch.Tensor(self.cls_len, self.embed_dim))
+            nn.init.xavier_uniform_(self.cls)
+            
+        if self.use_bert:
+            self.text_model = BertTextEncoder(language=getattr(hyp_params, "language", "en"), use_finetune=True)
+
+        self.proj_l = nn.Conv1d(self.orig_d_l, self.embed_dim, kernel_size=self.l_kernel_size)
+        self.proj_a = nn.Conv1d(self.orig_d_a, self.embed_dim, kernel_size=self.a_kernel_size)
+        if self.dataset not in ['meld_senti', 'meld_emo']:
+            self.proj_v = nn.Conv1d(self.orig_d_v, self.embed_dim, kernel_size=self.v_kernel_size)
+        
+        self.position_encoding_l = SinusoidalPositionalEmbedding(self.embed_dim)
+        self.position_encoding_a = SinusoidalPositionalEmbedding(self.embed_dim)
+        if self.dataset not in ['meld_senti', 'meld_emo']:
+            self.position_encoding_v = SinusoidalPositionalEmbedding(self.embed_dim)
+
+        # 单模态增强器
+        unimodal_layer = nn.TransformerEncoderLayer(
+            d_model=self.embed_dim, nhead=self.num_heads, dim_feedforward=self.embed_dim * 2, 
+            dropout=self.attn_dropout, norm_first=True
+        )
+        self.unimodal_encoder_l = nn.TransformerEncoder(unimodal_layer, num_layers=2)
+        self.unimodal_encoder_a = nn.TransformerEncoder(unimodal_layer, num_layers=2)
+        if self.dataset not in ['meld_senti', 'meld_emo']:
+            self.unimodal_encoder_v = nn.TransformerEncoder(unimodal_layer, num_layers=2)
+            
+        self.norm_cls = nn.LayerNorm(self.embed_dim)
+
+        # 归一化层
+        self.ln_l = nn.LayerNorm(self.embed_dim)
+        self.ln_a = nn.LayerNorm(self.embed_dim)
+        if self.dataset not in ['meld_senti', 'meld_emo']:
+            self.ln_v = nn.LayerNorm(self.embed_dim)
+
+        # --- [关键配置] 3. 混合条件 Prompt 生成器 (MLP + Summary) ---
+        self.num_prompts = 1 
+        
+        # 1. Text Prompt: 依然只由 Text CLS 生成 (Self-Conditioning)
+        # Input: (Batch, Dim) -> Output: (Batch, Num*Dim)
+        self.prompt_gen_l = nn.Sequential(
+            nn.Linear(self.embed_dim, self.embed_dim // 2),
+            nn.GELU(),
+            nn.Linear(self.embed_dim // 2, self.num_prompts * self.embed_dim)
+        )
+        
+        # 2. Audio Prompt: 由 [Text CLS, Audio Summary] 生成 (Cross-Conditioning)
+        # Input: (Batch, 2*Dim) -> Output: (Batch, Num*Dim)
+        self.prompt_gen_a = nn.Sequential(
+            nn.Linear(self.embed_dim * 2, self.embed_dim), 
+            nn.GELU(),
+            nn.Linear(self.embed_dim, self.num_prompts * self.embed_dim)
+        )
+        
+        # 3. Video Prompt: 由 [Text CLS, Video Summary] 生成
+        if self.dataset not in ['meld_senti', 'meld_emo']:
+            self.prompt_gen_v = nn.Sequential(
+                nn.Linear(self.embed_dim * 2, self.embed_dim),
+                nn.GELU(),
+                nn.Linear(self.embed_dim, self.num_prompts * self.embed_dim)
+            )
+        
+        # 初始化
+        for m in self.prompt_gen_l.modules():
+            if isinstance(m, nn.Linear): nn.init.xavier_uniform_(m.weight)
+        
+        
+        
+        
+        for m in self.prompt_gen_a.modules():
+            if isinstance(m, nn.Linear): nn.init.xavier_uniform_(m.weight)
+        if self.dataset not in ['meld_senti', 'meld_emo']:
+            for m in self.prompt_gen_v.modules():
+                if isinstance(m, nn.Linear): nn.init.xavier_uniform_(m.weight)
+
+        # --- 4. 深度融合 ---
+        self.fusion_modal_type_embeddings = nn.Embedding(4, self.embed_dim)
+        
+        self.fusion_encoder = MultimodalTransformerEncoder(
+            embed_dim=self.embed_dim,
+            num_heads=self.num_heads,
+            layers=hyp_params.multimodal_layers,
+            lens=(self.cls_len, self.l_len, self.a_len),
+            modalities=self.modalities,
+            attn_dropout=self.attn_dropout,
+            embed_positions=None 
+        )
+
+        # --- 5. 输出 ---
+        self.att_pool_linear = nn.Linear(self.embed_dim, 1)
+        self.proj1 = nn.Linear(self.embed_dim, self.embed_dim)
+        self.proj2 = nn.Linear(self.embed_dim, self.embed_dim)
+        self.out_layer = nn.Linear(self.embed_dim, output_dim)
+        
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight, gain=0.02)
+                if m.bias is not None: nn.init.constant_(m.bias, 0.0)
+            elif isinstance(m, nn.LayerNorm):
+                nn.init.constant_(m.bias, 0.0)
+                nn.init.constant_(m.weight, 1.0)
+            elif isinstance(m, nn.Embedding):
+                nn.init.normal_(m.weight, mean=0, std=self.embed_dim ** -0.5)
+
+    def forward(self, x_l, x_a, x_v=None, missing_mod=None):
+        """
+        missing_mod: Optional parameter to manually mask out a modality for testing robustness.
+                     e.g., 'A' to zero-out audio.
+        """
+        if x_l is None: raise ValueError("CFMModel requires text modality.")
+        batch_size = x_l.size(0)
+        scale = math.sqrt(self.embed_dim)
+
+        # --- 手动缺失实验逻辑 (Zero Masking) ---
+        if missing_mod is not None:
+            if 'A' in missing_mod: x_a = torch.zeros_like(x_a)
+            if x_v is not None and 'V' in missing_mod: x_v = torch.zeros_like(x_v)
+
+        if self.use_bert: x_l = self.text_model(x_l)
+            
+        # 1. 投影 & PosEnc
+        x_l_t = F.dropout(x_l.transpose(1, 2), p=self.embed_dropout, training=self.training)
+        proj_x_l = self.proj_l(x_l_t).permute(2, 0, 1) * scale
+        seq_len = proj_x_l.size(0)
+        batch_size = proj_x_l.size(1)
+        # 生成 [0, 1, 2, ... seq_len-1]
+        pos_ids = torch.arange(seq_len, device=proj_x_l.device).unsqueeze(1).repeat(1, batch_size) 
+        # 传入位置 ID
+        pe_l = self.position_encoding_l(pos_ids)
+        proj_x_l = proj_x_l + pe_l
+
+        x_a_t = F.dropout(x_a.transpose(1, 2), p=self.embed_dropout, training=self.training)
+        proj_x_a = self.proj_a(x_a_t).permute(2, 0, 1) * scale
+        pe_a = self.position_encoding_a(proj_x_a.transpose(0, 1)[:, :, 0]).transpose(0, 1)
+        proj_x_a = proj_x_a + pe_a
+        
+        proj_x_v = None
+        if x_v is not None and self.dataset not in ['meld_senti', 'meld_emo']:
+            x_v_t = F.dropout(x_v.transpose(1, 2), p=self.embed_dropout, training=self.training)
+            proj_x_v = self.proj_v(x_v_t).permute(2, 0, 1) * scale
+            pe_v = self.position_encoding_v(proj_x_v.transpose(0, 1)[:, :, 0]).transpose(0, 1)
+            proj_x_v = proj_x_v + pe_v
+
+        # 2. 单模态增强
+        proj_x_l = self.unimodal_encoder_l(proj_x_l)
+        proj_x_a = self.unimodal_encoder_a(proj_x_a)
+        if proj_x_v is not None:
+            proj_x_v = self.unimodal_encoder_v(proj_x_v)
+
+        # 3. 归一化
+        proj_x_l = self.ln_l(proj_x_l)
+        proj_x_a = self.ln_a(proj_x_a)
+        if proj_x_v is not None:
+            proj_x_v = self.ln_v(proj_x_v)
+
+        # 4. 准备 [CLS] Token
+        if self.dataset in ['meld_senti', 'meld_emo']:
+            cls_input = torch.cat((x_l_t, x_a_t), dim=1)
+            cls_token = self.proj_cls(cls_input).permute(2, 0, 1) * scale
+            pe_cls = self.position_encoding_l(cls_token.transpose(0, 1)[:, :, 0]).transpose(0, 1)
+            cls_token = cls_token + pe_cls
+            cls_feat = cls_token.mean(dim=0) 
+        else:
+            cls_token = self.cls.unsqueeze(1).repeat(1, batch_size, 1) * scale
+            cls_feat = cls_token.squeeze(0) # (Batch, Dim)
+
+        # === [核心逻辑] 5. 混合条件生成 Prompt (MLP) ===
+        
+        # Text Prompt (由 CLS 生成)
+        p_l = self.prompt_gen_l(cls_feat).view(batch_size, self.num_prompts, self.embed_dim).permute(1, 0, 2)
+        
+        # Audio Prompt (由 CLS + Audio Summary 生成)
+        # 计算 Audio Summary: 对序列维度求平均 -> (Batch, Dim)
+        # 这里的 Summary 实际上起到了 "Low-pass Filter" 的作用，过滤了噪音
+        summary_a = proj_x_a.mean(dim=0)
+        # 拼接 -> (Batch, 2*Dim)
+        cond_a = torch.cat([cls_feat, summary_a], dim=-1)
+        # 生成
+        p_a = self.prompt_gen_a(cond_a).view(batch_size, self.num_prompts, self.embed_dim).permute(1, 0, 2)
+        
+        # 拼接列表
+        seqs_to_cat = [cls_token, p_l, proj_x_l, p_a, proj_x_a]
+        
+        # ID 构造
+        id_list = []
+        id_list.append(torch.zeros(cls_token.shape[0], dtype=torch.long, device=x_l.device)) 
+        id_list.append(torch.ones(p_l.shape[0], dtype=torch.long, device=x_l.device) * 1)    
+        id_list.append(torch.ones(proj_x_l.shape[0], dtype=torch.long, device=x_l.device) * 1) 
+        id_list.append(torch.ones(p_a.shape[0], dtype=torch.long, device=x_l.device) * 2)    
+        id_list.append(torch.ones(proj_x_a.shape[0], dtype=torch.long, device=x_l.device) * 2) 
+        
+        # Video Prompt (如有)
+        if proj_x_v is not None and hasattr(self, 'prompt_gen_v'):
+            # Video Summary
+            summary_v = proj_x_v.mean(dim=0)
+            cond_v = torch.cat([cls_feat, summary_v], dim=-1)
+            p_v = self.prompt_gen_v(cond_v).view(batch_size, self.num_prompts, self.embed_dim).permute(1, 0, 2)
+            
+            seqs_to_cat.append(p_v)
+            seqs_to_cat.append(proj_x_v)
+            
+            id_list.append(torch.ones(p_v.shape[0], dtype=torch.long, device=x_l.device) * 3)
+            id_list.append(torch.ones(proj_x_v.shape[0], dtype=torch.long, device=x_l.device) * 3)
+            
+        fused_input = torch.cat(seqs_to_cat, dim=0)
+        
+        type_ids_cat = torch.cat(id_list, dim=0)
+        type_ids = type_ids_cat.unsqueeze(1).repeat(1, batch_size)
+        
+        fused_input = fused_input + self.fusion_modal_type_embeddings(type_ids)
+
+        # 6. 深度融合
+        final_fused = self.fusion_encoder(fused_input)
+
+        # 7. 预测
+        
+        if self.dataset in ['meld_senti', 'meld_emo']:
+             last_hs = final_fused[:cls_token.shape[0]]
+        else:
+            att_scores = self.att_pool_linear(final_fused) 
+            att_weights = F.softmax(att_scores, dim=0)     
+            last_hs = (att_weights * final_fused).sum(dim=0)
+
+        last_hs_proj = self.proj2(F.dropout(F.relu(self.proj1(last_hs)), p=self.out_dropout, training=self.training))
+        last_hs_proj += last_hs
+        output = self.out_layer(last_hs_proj)
+        
+        if self.dataset in ['meld_senti', 'meld_emo']:
+            output = output.transpose(0, 1)
+            
+        return output, last_hs
